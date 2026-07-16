@@ -17,7 +17,12 @@
 #   DGROK_CHANNEL                  unused alias for parity; always "latest" release
 #   DGROK_FROM_SOURCE=1            force cargo build (dev)
 #   DGROK_NO_SOURCE=1              fail if release download fails
+#   DGROK_REF                      git branch/tag for source installs (default: main)
+#   DGROK_SRC                      checkout path (default: ~/.grok/src/digi-grok-build)
 #   GITHUB_TOKEN                   optional; higher API rate limits
+#
+# Source installs always fetch the latest $DGROK_REF into $DGROK_SRC before
+# building (so re-running the curl installer updates, not only rebuilds).
 
 set -e
 
@@ -210,7 +215,7 @@ finish() {
     echo "" >&2
     if path_has_dir "$BIN_DIR"; then
         echo "Run 'dgrok' to get started!" >&2
-        echo "In the TUI: /provider add <name> <url> …" >&2
+        echo "In the TUI: /provider presets | /provider add nvidia --set-default" >&2
     else
         echo "Restart your terminal, then run 'dgrok' to get started!" >&2
         echo "  export PATH=\"$BIN_DIR:\$PATH\"" >&2
@@ -292,34 +297,106 @@ try_prebuilt() {
     return 0
 }
 
+# True if $1 looks like a digi-grok-build checkout (branded dgrok binary package).
+is_digi_tree() {
+    local root="$1"
+    [ -f "$root/crates/codegen/xai-grok-pager-bin/Cargo.toml" ] \
+        && grep -q 'name = "dgrok"' "$root/crates/codegen/xai-grok-pager-bin/Cargo.toml" 2>/dev/null
+}
+
+# Clone or hard-reset $SRC_DIR to origin/$REPO_REF (or tag). Fails if update fails.
+# Shallow pull --ff-only is unreliable; always fetch then reset --hard.
+sync_src_checkout() {
+    local ref="${1:-$REPO_REF}"
+    local tip=""
+    command -v git >/dev/null 2>&1 || { echo "git required for source install" >&2; exit 1; }
+    mkdir -p "$(dirname "$SRC_DIR")"
+
+    if [ ! -d "$SRC_DIR/.git" ]; then
+        echo "Cloning $REPO_URL ($ref) → $SRC_DIR …" >&2
+        rm -rf "$SRC_DIR"
+        if ! git clone --depth 1 --branch "$ref" "$REPO_URL" "$SRC_DIR" 2>/dev/null; then
+            git clone --depth 1 "$REPO_URL" "$SRC_DIR" \
+                || { echo "Error: git clone failed" >&2; exit 1; }
+            git -C "$SRC_DIR" fetch --depth 1 origin "$ref" 2>/dev/null || true
+        fi
+    fi
+
+    echo "Updating source at $SRC_DIR to $ref …" >&2
+    git -C "$SRC_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || true
+
+    # Prefer branch tip; also try tag. +refspec overwrites local remote-tracking ref.
+    if git -C "$SRC_DIR" fetch --force --depth 1 origin \
+        "+refs/heads/${ref}:refs/remotes/origin/${ref}" 2>/dev/null; then
+        tip="origin/${ref}"
+    elif git -C "$SRC_DIR" fetch --force --depth 1 origin \
+        "+refs/tags/${ref}:refs/tags/${ref}" 2>/dev/null; then
+        tip="refs/tags/${ref}"
+    elif git -C "$SRC_DIR" fetch --force --depth 1 origin "$ref" 2>/dev/null; then
+        tip="FETCH_HEAD"
+    else
+        echo "git fetch failed; recloning clean checkout…" >&2
+        rm -rf "$SRC_DIR"
+        git clone --depth 1 --branch "$ref" "$REPO_URL" "$SRC_DIR" \
+            || git clone --depth 1 "$REPO_URL" "$SRC_DIR" \
+            || { echo "Error: git clone failed" >&2; exit 1; }
+        tip="HEAD"
+    fi
+
+    # Detach/reset so a dirty or stale local branch cannot block updates.
+    if [ "$tip" = "HEAD" ]; then
+        :
+    elif [ "$tip" = "FETCH_HEAD" ]; then
+        git -C "$SRC_DIR" checkout -q --detach FETCH_HEAD \
+            || git -C "$SRC_DIR" reset --hard FETCH_HEAD
+    else
+        git -C "$SRC_DIR" checkout -q -B "$ref" "$tip" 2>/dev/null \
+            || git -C "$SRC_DIR" checkout -q --detach "$tip"
+        git -C "$SRC_DIR" reset --hard "$tip"
+    fi
+
+    # Drop untracked debris that could confuse builds (never force-delete user data outside SRC_DIR).
+    git -C "$SRC_DIR" clean -fd -e target 2>/dev/null || true
+
+    echo "  source revision: $(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)" >&2
+}
+
 build_from_source() {
     local profile="${DGROK_PROFILE:-release}"
     local repo_root="" cargo_flags=()
+    local use_local_tree=0
     echo "No prebuilt release for this platform — building from source ($profile)…" >&2
 
-    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    # Prefer an in-tree checkout only when the script is run from a real file on
+    # disk (not `curl | bash`) and that tree is digi-branded. Set
+    # DGROK_FORCE_REMOTE_SRC=1 to always sync ~/.grok/src/… instead.
+    if [ "${DGROK_FORCE_REMOTE_SRC:-0}" != "1" ] \
+        && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
         local here
         here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        if [ -f "$here/../crates/codegen/xai-grok-shell/src/agent/provider_add.rs" ]; then
+        if is_digi_tree "$here/.."; then
             repo_root="$(cd "$here/.." && pwd)"
+            use_local_tree=1
+            echo "Building from local digi tree: $repo_root" >&2
+            if [ -d "$repo_root/.git" ]; then
+                echo "  (local git tree — not auto-pulling; use git pull yourself or DGROK_FORCE_REMOTE_SRC=1)" >&2
+            fi
         fi
     fi
-    if [ -z "$repo_root" ]; then
-        command -v git >/dev/null 2>&1 || { echo "git required for source install" >&2; exit 1; }
-        mkdir -p "$(dirname "$SRC_DIR")"
-        if [ -d "$SRC_DIR/.git" ]; then
-            git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF" 2>/dev/null || true
-            git -C "$SRC_DIR" checkout -q "$REPO_REF" 2>/dev/null || true
-            git -C "$SRC_DIR" pull --ff-only origin "$REPO_REF" 2>/dev/null || true
-        else
-            rm -rf "$SRC_DIR"
-            git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$SRC_DIR" \
-                || git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+
+    if [ "$use_local_tree" != "1" ]; then
+        # Pin to release tag when installing a versioned prebuilt fallback path.
+        local sync_ref="$REPO_REF"
+        if [ -n "${VERSION_TAG:-}" ]; then
+            sync_ref="$VERSION_TAG"
         fi
+        sync_src_checkout "$sync_ref"
         repo_root="$SRC_DIR"
     fi
-    if [ ! -f "$repo_root/crates/codegen/xai-grok-shell/src/agent/provider_add.rs" ]; then
-        echo "Error: tree is not digi-grok-build (missing /provider support)." >&2
+
+    if ! is_digi_tree "$repo_root"; then
+        echo "Error: $repo_root is not digi-grok-build (expected dgrok binary package)." >&2
+        echo "Remove $SRC_DIR and re-run, or set DGROK_SRC / DGROK_REPO_SLUG." >&2
         exit 1
     fi
     if ! command -v cargo >/dev/null 2>&1; then
@@ -329,6 +406,7 @@ build_from_source() {
         [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
     fi
     [ "$profile" = "release" ] && cargo_flags+=(--release)
+    echo "Building dgrok ($profile) in $repo_root …" >&2
     (cd "$repo_root" && cargo build -p xai-grok-pager-bin "${cargo_flags[@]}")
     local bin="$repo_root/target/$profile/dgrok"
     [ -x "${bin}.exe" ] && bin="${bin}.exe"

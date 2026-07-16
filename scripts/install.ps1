@@ -43,7 +43,7 @@ function Finish-Install([string]$Dest) {
     } catch {}
     Write-Host ""
     Write-Host "Run 'dgrok' to get started!" -ForegroundColor Cyan
-    Write-Host "In the TUI: /provider add <name> <url> …" -ForegroundColor Cyan
+    Write-Host "In the TUI: /provider presets | /provider add nvidia --set-default" -ForegroundColor Cyan
 }
 
 function Install-Binary([string]$Src) {
@@ -100,37 +100,101 @@ function Try-Prebuilt {
     return $true
 }
 
+function Test-DigiTree([string]$Root) {
+    $cargo = Join-Path $Root 'crates\codegen\xai-grok-pager-bin\Cargo.toml'
+    if (-not (Test-Path $cargo)) { return $false }
+    return (Select-String -Path $cargo -Pattern 'name = "dgrok"' -Quiet)
+}
+
+function Sync-SrcCheckout([string]$Ref) {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git required for source install' }
+    New-Item -ItemType Directory -Force -Path (Split-Path $SrcDir -Parent) | Out-Null
+    if (-not (Test-Path (Join-Path $SrcDir '.git'))) {
+        Write-Host "Cloning $RepoUrl ($Ref) → $SrcDir …" -ForegroundColor DarkGray
+        if (Test-Path $SrcDir) { Remove-Item -Recurse -Force $SrcDir }
+        try {
+            git clone --depth 1 --branch $Ref $RepoUrl $SrcDir
+        } catch {
+            git clone --depth 1 $RepoUrl $SrcDir
+        }
+        if (-not (Test-Path (Join-Path $SrcDir '.git'))) { throw 'git clone failed' }
+    }
+
+    Write-Host "Updating source at $SrcDir to $Ref …" -ForegroundColor DarkGray
+    Push-Location $SrcDir
+    try {
+        git remote set-url origin $RepoUrl 2>$null
+        $tip = $null
+        git fetch --force --depth 1 origin "+refs/heads/${Ref}:refs/remotes/origin/${Ref}" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $tip = "origin/$Ref"
+        } else {
+            git fetch --force --depth 1 origin "+refs/tags/${Ref}:refs/tags/${Ref}" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $tip = "refs/tags/$Ref"
+            } else {
+                git fetch --force --depth 1 origin $Ref 2>$null
+                if ($LASTEXITCODE -eq 0) { $tip = 'FETCH_HEAD' }
+            }
+        }
+        if (-not $tip) {
+            Write-Host 'git fetch failed; recloning…' -ForegroundColor Yellow
+            Pop-Location
+            Remove-Item -Recurse -Force $SrcDir
+            git clone --depth 1 --branch $Ref $RepoUrl $SrcDir
+            if (-not (Test-Path (Join-Path $SrcDir '.git'))) { throw 'git clone failed' }
+            Push-Location $SrcDir
+            $tip = 'HEAD'
+        }
+        if ($tip -ne 'HEAD') {
+            git checkout -B $Ref $tip 2>$null
+            if ($LASTEXITCODE -ne 0) { git checkout --detach $tip }
+            git reset --hard $tip
+            if ($LASTEXITCODE -ne 0) { throw "git reset --hard $tip failed" }
+        }
+        git clean -fd -e target 2>$null
+        $rev = (git rev-parse --short HEAD 2>$null)
+        Write-Host "  source revision: $rev" -ForegroundColor DarkGray
+    } finally {
+        Pop-Location
+    }
+}
+
 function Install-FromSource {
     Write-Host 'No prebuilt release — building from source…' -ForegroundColor Yellow
     $repoRoot = $null
-    if ($PSScriptRoot) {
+    $forceRemote = $env:DGROK_FORCE_REMOTE_SRC -eq '1'
+    if (-not $forceRemote -and $PSScriptRoot) {
         $cand = Resolve-Path (Join-Path $PSScriptRoot '..') -ErrorAction SilentlyContinue
-        if ($cand -and (Test-Path (Join-Path $cand 'crates\codegen\xai-grok-shell\src\agent\provider_add.rs'))) {
+        if ($cand -and (Test-DigiTree $cand.Path)) {
             $repoRoot = $cand.Path
+            Write-Host "Building from local digi tree: $repoRoot" -ForegroundColor DarkGray
+            Write-Host '  (local git tree — not auto-pulling; git pull yourself or set DGROK_FORCE_REMOTE_SRC=1)' -ForegroundColor DarkGray
         }
     }
     if (-not $repoRoot) {
-        if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git required for source install' }
-        New-Item -ItemType Directory -Force -Path (Split-Path $SrcDir -Parent) | Out-Null
-        if (Test-Path (Join-Path $SrcDir '.git')) {
-            Push-Location $SrcDir
-            try { git fetch origin $RepoRef 2>$null; git checkout $RepoRef 2>$null; git pull --ff-only origin $RepoRef 2>$null } finally { Pop-Location }
-        } else {
-            if (Test-Path $SrcDir) { Remove-Item -Recurse -Force $SrcDir }
-            git clone --depth 1 --branch $RepoRef $RepoUrl $SrcDir
-        }
+        $syncRef = $RepoRef
+        if ($Version) { $syncRef = $Version }
+        Sync-SrcCheckout $syncRef
         $repoRoot = $SrcDir
+    }
+    if (-not (Test-DigiTree $repoRoot)) {
+        throw "Not digi-grok-build (expected dgrok binary package): $repoRoot"
     }
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         throw 'cargo not found — install from https://rustup.rs'
     }
+    Write-Host "Building dgrok (release) in $repoRoot …" -ForegroundColor DarkGray
     Push-Location $repoRoot
     try {
-        & cargo build -p xai-grok-pager-bin --release --no-default-features --features sandbox-enforce
+        & cargo build -p xai-grok-pager-bin --release
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
     } finally { Pop-Location }
     $src = Join-Path $repoRoot 'target\release\dgrok.exe'
-    if (-not (Test-Path $src)) { throw "binary not found: $src" }
+    if (-not (Test-Path $src)) {
+        $src = Join-Path $repoRoot 'target\release\dgrok'
+    }
+    if (-not (Test-Path $src)) { throw "binary not found under target/release/dgrok*" }
     Install-Binary $src
 }
 
