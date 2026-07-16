@@ -1,0 +1,170 @@
+# Build dgrok for GitHub Releases so install scripts can download binaries
+# instead of compiling on every machine.
+#
+# Trigger:
+#   - Push a tag:  git tag v0.1.0 && git push origin v0.1.0
+#   - Or Actions → Release → Run workflow
+#
+# Asset names (install scripts depend on these):
+#   dgrok-linux-x86_64
+#   dgrok-linux-aarch64
+#   dgrok-darwin-x86_64
+#   dgrok-darwin-aarch64
+#   dgrok-windows-x86_64.exe
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0). Created if missing when dispatching."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: dgrok-linux-x86_64
+            features: ""
+          # Public ARM Linux runners (skip silently if unavailable for private forks).
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: dgrok-linux-aarch64
+            features: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: dgrok-darwin-x86_64
+            features: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: dgrok-darwin-aarch64
+            features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: dgrok-windows-x86_64.exe
+            # jemalloc is Unix-only; build without default features on Windows
+            features: "--no-default-features --features sandbox-enforce"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          protoc --version
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+          protoc --version
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install protoc -y
+          protoc --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release dgrok
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES='${{ matrix.features }}'
+          # shellcheck disable=SC2086
+          cargo build -p xai-grok-pager-bin --release --target "${{ matrix.target }}" $FEATURES
+          BIN="target/${{ matrix.target }}/release/dgrok"
+          if [[ "${{ matrix.asset }}" == *.exe ]]; then
+            BIN="${BIN}.exe"
+          fi
+          test -f "$BIN"
+          mkdir -p dist
+          cp "$BIN" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}" || true
+          # Fingerprint: digi fork must include /provider
+          if command -v strings >/dev/null 2>&1; then
+            strings "dist/${{ matrix.asset }}" | grep -F '/provider add' >/dev/null \
+              || { echo "ERROR: built binary missing /provider add string"; exit 1; }
+          fi
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all assets
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lah assets/
+
+      - name: Checksums
+        run: |
+          cd assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: digi dgrok ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

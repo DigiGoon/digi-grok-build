@@ -408,9 +408,10 @@ fn version_with_channel() -> &'static str {
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "grok",
+    name = "dgrok",
+    bin_name = "dgrok",
     version = version_with_channel(),
-    about = "Grok Build TUI",
+    about = "digi Grok Build TUI (dgrok)",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
@@ -778,8 +779,8 @@ impl PagerArgs {
             .map(std::path::Path::new)
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .filter(|n| *n == "grok" || *n == "agent")
-            .unwrap_or("grok")
+            .filter(|n| *n == "dgrok" || *n == "grok" || *n == "agent")
+            .unwrap_or("dgrok")
             .to_owned();
         let mut args = Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)));
         if let Some(socket) = args.leader_socket.take() {
