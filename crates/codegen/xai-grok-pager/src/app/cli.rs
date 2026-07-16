@@ -50,6 +50,10 @@ pub enum Command {
     Memory(crate::memory_cmd::MemoryArgs),
     /// List available models and exit
     Models,
+    /// Check multi-provider config health (official config.toml)
+    Doctor,
+    /// Manage custom models in ~/.grok/config.toml (official multi-provider feature)
+    Provider(crate::provider_config_cmd::ProviderArgs),
     /// List, search, or restore sessions
     Sessions(crate::sessions_cmd::SessionsArgs),
     /// Fetch and install managed configuration

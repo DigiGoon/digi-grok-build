@@ -4,7 +4,7 @@
 use std::path::Path;
 
 #[must_use]
-pub(crate) fn read_config_document_for_edit(path: &Path) -> Option<toml_edit::DocumentMut> {
+pub fn read_config_document_for_edit(path: &Path) -> Option<toml_edit::DocumentMut> {
     #[allow(clippy::manual_unwrap_or_default)]
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,

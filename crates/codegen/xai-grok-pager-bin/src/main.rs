@@ -1802,6 +1802,15 @@ async fn async_main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::models::list_available_models(&agent_config).await;
             }
+            Command::Doctor => {
+                println!("{}", xai_grok_pager::provider_config_cmd::run_doctor());
+                return Ok(());
+            }
+            Command::Provider(provider_args) => {
+                xai_grok_pager::provider_config_cmd::run_provider_cli(provider_args)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                return Ok(());
+            }
             Command::Leader(leader_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
