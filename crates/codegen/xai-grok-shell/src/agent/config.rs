@@ -4299,37 +4299,59 @@ pub(crate) fn first_own_credential(
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
 /// Resolve credentials for a model.
-/// Priority: model api_key/env_key > session token > XAI_API_KEY.
+/// Priority: model api_key/env_key > session token (first-party only) > XAI_API_KEY
+/// (first-party / api_base_url only).
+///
+/// **Third-party hosts** (`base_url` not xAI): never attach the signed-in xAI
+/// session JWT or global `XAI_API_KEY`. Those look like a Bearer token to
+/// OpenCode/NVIDIA/etc. and return `Invalid API key` (401); Grok then "auth
+/// recovers" the OIDC session and retries with another JWT — the familiar
+/// "Auth recovery succeeded but inference still rejected (401)" loop.
 ///
 /// When `env_key` lists multiple names, the first set non-empty value is used.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
+    let first_party = crate::util::is_xai_api_bearer_url(&info.base_url);
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
-    } else if let Some(key) = session_key {
+    } else if let Some(key) = session_key.filter(|_| first_party) {
         (
             Some(key.to_owned()),
             info.base_url.clone(),
             xai_chat_state::AuthType::SessionToken,
         )
-    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+    } else if first_party
+        && let Ok(key) = crate::agent::auth_method::read_xai_api_key_env()
+    {
         let url = model
             .api_base_url
             .clone()
             .unwrap_or_else(|| info.base_url.clone());
+        (Some(key), url, xai_chat_state::AuthType::ApiKey)
+    } else if !first_party
+        && let Ok(key) = crate::agent::auth_method::read_xai_api_key_env()
+        && model.api_base_url.is_some()
+    {
+        // Custom model may still use first-party api_base_url for global key.
+        let url = model.api_base_url.clone().unwrap();
         (Some(key), url, xai_chat_state::AuthType::ApiKey)
     } else {
         if let Some(ref env_keys) = model.env_key
             && !env_keys.is_empty()
         {
             tracing::warn!(
-                model = % info.model, env_key = % env_keys,
+                model = % info.model, env_key = % env_keys, base_url = % info.base_url,
                 "model has env_key configured but none of the environment variables are set — \
-                 requests will have no API key",
+                 third-party request will have no API key (xAI session is NOT sent)",
+            );
+        } else if !first_party && session_key.is_some() {
+            tracing::warn!(
+                model = % info.model, base_url = % info.base_url,
+                "third-party model has no api_key/env_key — not attaching xAI session token",
             );
         }
         (
@@ -5645,12 +5667,32 @@ reasoning_effort = "low"
         let alias = "GROK_TEST_EMPTY_ENV_LC_ALIAS";
         let _primary = EnvGuard::set(primary, "");
         let _alias = EnvGuard::set(alias, "");
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
+        // First-party host: empty env_key still uses session.
+        let mut model = test_model_entry("m", "https://api.x.ai/v1", None, None, None);
         model.env_key = Some(EnvKeys::new([primary, alias]));
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, Some("session-jwt"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
         assert_eq!(creds.api_key.as_deref(), Some("session-jwt"));
+    }
+
+    /// Third-party hosts must not receive the xAI session JWT when BYOK is missing.
+    #[test]
+    fn resolve_credentials_third_party_skips_session_token() {
+        use xai_chat_state::AuthType;
+        let model = test_model_entry(
+            "mimo",
+            "https://opencode.ai/zen/v1",
+            None,
+            None,
+            None,
+        );
+        let creds = resolve_credentials(&model, Some("eyJ-session-jwt"));
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_eq!(
+            creds.api_key, None,
+            "must not send xAI JWT to OpenCode (causes Invalid API key 401 loop)"
+        );
     }
     #[test]
     #[serial]
@@ -5665,7 +5707,8 @@ reasoning_effort = "low"
         let _alias = EnvGuard::set(alias, "");
         let _global = EnvGuard::set(XAI_API_KEY_ENV_VAR, sentinel);
         let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
+        // First-party only: XAI_API_KEY must not be sent to third-party hosts.
+        let mut model = test_model_entry("m", "https://api.x.ai/v1", None, None, None);
         model.env_key = Some(EnvKeys::new([primary, alias]));
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, None);
@@ -5675,7 +5718,8 @@ reasoning_effort = "low"
     #[test]
     fn resolve_credentials_empty_api_key_falls_through_to_session() {
         use xai_chat_state::AuthType;
-        let model = test_model_entry("m", "https://inference.example/v1", Some(""), None, None);
+        // Empty api_key on first-party → session.
+        let model = test_model_entry("m", "https://api.x.ai/v1", Some(""), None, None);
         assert!(!model.has_own_credentials());
         let creds = resolve_credentials(&model, Some("session-jwt"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
@@ -5705,12 +5749,15 @@ reasoning_effort = "low"
     #[test]
     fn resolve_credentials_sets_auth_type() {
         use xai_chat_state::AuthType;
-        let model = test_model_entry("m", "https://example.com/v1", None, None, None);
+        // First-party without BYOK → session.
+        let model = test_model_entry("m", "https://api.x.ai/v1", None, None, None);
         let creds = resolve_credentials(&model, Some("tok"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
+        // Third-party with BYOK → api key even if session present.
         let byok = test_model_entry("m", "https://example.com/v1", Some("key"), None, None);
         let creds = resolve_credentials(&byok, Some("tok"));
         assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_eq!(creds.api_key.as_deref(), Some("key"));
     }
     /// Regression: BYOK env-var auth must stay ApiKey even when signed in,
     /// otherwise the bearer resolver overwrites the BYOK key with a session JWT.

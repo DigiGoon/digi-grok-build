@@ -492,7 +492,12 @@ pub struct ChatResponseMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// OpenCode Zen / OpenRouter use `reasoning`; xAI uses `reasoning_content`.
+    #[serde(
+        default,
+        alias = "reasoning",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallResponse>,
@@ -571,10 +576,18 @@ pub struct CompletionTokensDetails {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionChunk {
+    /// Some gateways (OpenCode Zen / OpenRouter) emit trailing cost-only
+    /// chunks like `{"choices":[],"cost":"0"}` with no `id`/`model`. Default
+    /// so those do not fail the whole stream after the answer already arrived.
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<ChatChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -637,6 +650,13 @@ pub struct ChatChunkDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// OpenAI-compatible reasoning text. OpenCode Zen / OpenRouter send this
+    /// as `reasoning` (not `reasoning_content`); accept both.
+    #[serde(
+        default,
+        alias = "reasoning",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_content: Option<String>,
     /// Tool call deltas. Handles `null` in JSON as empty vec.
     #[serde(
@@ -1470,6 +1490,27 @@ mod tests {
         assert_eq!(delta.role, Some(Role::Assistant));
         assert_eq!(delta.content, Some("".to_string()));
         assert!(delta.tool_calls.is_empty());
+    }
+
+    /// OpenCode Zen trailing cost chunks omit `id`/`model` (serde error was
+    /// `missing field id at line 1 column ~217` after the answer already streamed).
+    #[test]
+    fn opencode_cost_only_chunk_deserializes() {
+        let json = r#"{"choices":[],"x-opencode-type":"inference-cost","cost":"0.00000000","normalizedUsage":{"inputTokens":56,"outputTokens":64,"reasoningTokens":63,"cacheReadTokens":192,"cacheWrite5mTokens":0,"cacheWrite1hTokens":0}}"#;
+        let chunk: ChatCompletionChunk =
+            serde_json::from_str(json).expect("cost-only chunk must not fail the stream");
+        assert!(chunk.choices.is_empty());
+        assert!(chunk.id.is_empty());
+
+        let short = r#"{"choices":[],"cost":"0"}"#;
+        serde_json::from_str::<ChatCompletionChunk>(short).expect("short cost chunk");
+    }
+
+    #[test]
+    fn opencode_reasoning_alias_on_delta() {
+        let json = r#"{"role":"assistant","content":"","reasoning":"Hmm"}"#;
+        let delta: ChatChunkDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("Hmm"));
     }
 
     /// Regression test: cloning `Box<dyn TraceContext>` must not infinitely recurse.
