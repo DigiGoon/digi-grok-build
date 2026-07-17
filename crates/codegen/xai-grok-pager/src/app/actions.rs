@@ -705,6 +705,18 @@ pub enum Action {
     SetCodingDataSharing {
         opted_in: bool,
     },
+    /// Open interactive provider setup (endpoint list → key → models).
+    /// Writes official `[model.*]` entries; OpenClaude-style UX over config.toml.
+    OpenProviderSetup,
+    /// Continue the provider setup wizard after a local question answer.
+    ProviderSetupAnswered {
+        step: crate::provider_setup::WizardStep,
+        /// Selected option indices (single or multi).
+        selected: Vec<usize>,
+        /// Freeform text (API key, custom URL line, etc.).
+        freeform: String,
+        skipped: bool,
+    },
     /// `/fork` slash command: parsed args produced by
     /// [`crate::slash::commands::fork::parse_fork_args`]. The dispatcher
     /// resolves the worktree question (via flag or the local

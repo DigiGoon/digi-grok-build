@@ -1094,6 +1094,15 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 cwd,
             }]
         }
+        Action::OpenProviderSetup => super::provider_setup::open_provider_setup(app),
+        Action::ProviderSetupAnswered {
+            step,
+            selected,
+            freeform,
+            skipped,
+        } => super::provider_setup::dispatch_provider_setup_answered(
+            app, step, selected, freeform, skipped,
+        ),
         Action::Fork(args) => dispatch_fork(app, args),
         Action::ForkAnswered {
             worktree,

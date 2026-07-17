@@ -1599,6 +1599,32 @@ fn translate_local_submit(
             skipped,
         );
     }
+    if let LocalQuestionKind::ProviderSetup { step } = kind {
+        if skipped {
+            return InputOutcome::Changed;
+        }
+        let freeform = qv
+            .per_question_freeform
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let selected = match qv.selections.first() {
+            Some(QuestionSelection::Multi(set)) => {
+                let mut v: Vec<usize> = set.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+            Some(QuestionSelection::Single(Some(i))) => vec![*i],
+            Some(QuestionSelection::Single(None)) => vec![],
+            None => vec![],
+        };
+        return InputOutcome::Action(Action::ProviderSetupAnswered {
+            step,
+            selected,
+            freeform,
+            skipped: false,
+        });
+    }
     if skipped {
         return InputOutcome::Changed;
     }
@@ -1666,6 +1692,7 @@ fn translate_local_submit(
                 effort,
             })
         }
+        LocalQuestionKind::ProviderSetup { .. } => unreachable!("handled above"),
         LocalQuestionKind::ProjectSelect { .. } => unreachable!(),
     }
 }

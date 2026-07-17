@@ -127,6 +127,11 @@ pub enum LocalQuestionKind {
         model_id: agent_client_protocol::ModelId,
         effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
     },
+    /// Interactive multi-provider setup (`/provider setup`).
+    /// Step payload is advanced by `Action::ProviderSetupAnswered`.
+    ProviderSetup {
+        step: crate::provider_setup::WizardStep,
+    },
 }
 
 // ── State ──────────────────────────────────────────────────────────────
@@ -1069,14 +1074,17 @@ pub fn question_view_height(state: &mut QuestionViewState, screen_h: u16, conten
     total.min(cap)
 }
 
-/// Shortcut label for an option index: 1-9 then a-z.
+/// Shortcut label for an option index: 1-9 then a-f.
 ///
-/// Returns `'1'`..`'9'` for indices 0..8, `'a'`..`'z'` for 9..34.
-/// Returns `None` for indices ≥ 35.
+/// Returns `'1'`..`'9'` for indices 0..8, `'a'`..`'f'` for 9..14.
+/// Returns `None` beyond that — must match [`option_index_for_key`] exactly,
+/// since a displayed letter the key handler doesn't accept (previously
+/// g-z, which `option_index_for_key` never mapped) is a dead shortcut that
+/// silently falls through to nav keys (g=top, j/k=down/up, etc).
 pub fn option_shortcut_label(idx: usize) -> Option<char> {
     match idx {
         0..=8 => Some((b'1' + idx as u8) as char),
-        9..=34 => Some((b'a' + (idx - 9) as u8) as char),
+        9..=14 => Some((b'a' + (idx - 9) as u8) as char),
         _ => None,
     }
 }

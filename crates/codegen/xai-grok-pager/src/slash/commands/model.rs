@@ -172,11 +172,15 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
             info.name.clone()
         };
 
+        // Right column: provider / description from [model.*].description
+        // (set by `dgrok provider setup` to e.g. "OpenCode Zen").
+        let description = info.description.clone().unwrap_or_default();
+
         items.push(ArgItem {
             display,
             match_text: info.name.clone(),
             insert_text,
-            description: info.description.clone().unwrap_or_default(),
+            description,
         });
     }
     items

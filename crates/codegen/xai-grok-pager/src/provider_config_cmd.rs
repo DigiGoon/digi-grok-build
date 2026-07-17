@@ -53,6 +53,22 @@ pub enum ProviderCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Interactive setup: list endpoints → key → fetch models → write config
+    Setup,
+    /// Write api_key onto existing [model.*] (fixes 401 when env_key is unset)
+    SetKey {
+        /// Only models with this env_key (default: OPENCODE_API_KEY)
+        #[arg(long)]
+        env_key: Option<String>,
+        /// Or match base_url substring (e.g. opencode.ai / nvidia.com)
+        #[arg(long)]
+        base_url_contains: Option<String>,
+        /// API key value (omit to prompt interactively)
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// List curated endpoints (OpenCode, NVIDIA, Anthropic, Codex, …)
+    Endpoints,
     /// Print short usage + pointer to official docs
     Guide,
 }
@@ -79,7 +95,16 @@ pub fn builtin_presets() -> &'static [ModelPreset] {
             name: "NVIDIA NIM",
             env_key: Some("NVIDIA_API_KEY"),
             api_backend: Some("chat_completions"),
-            notes: "OpenAI-compatible NIM. Set model= to a NIM id (e.g. z-ai/glm-5.2).",
+            notes: "OpenAI-compatible NIM. Set model= to a NIM id (e.g. z-ai/glm-5.2). export NVIDIA_API_KEY before launch.",
+        },
+        ModelPreset {
+            id: "opencode",
+            model: "mimo-v2.5-free",
+            base_url: "https://opencode.ai/zen/v1",
+            name: "OpenCode Zen",
+            env_key: Some("OPENCODE_API_KEY"),
+            api_backend: Some("chat_completions"),
+            notes: "base_url is .../zen/v1 only (no /chat/completions). API model id is bare (mimo-v2.5-free), not opencode/….",
         },
         ModelPreset {
             id: "openai",
@@ -117,7 +142,56 @@ pub fn builtin_presets() -> &'static [ModelPreset] {
             api_backend: Some("chat_completions"),
             notes: "OpenRouter OpenAI-compatible gateway.",
         },
+        ModelPreset {
+            id: "codex",
+            model: "gpt-5.4",
+            base_url: "https://api.openai.com/v1",
+            name: "OpenAI Codex / Responses",
+            env_key: Some("OPENAI_API_KEY"),
+            api_backend: Some("responses"),
+            notes: "Responses API. No browser OAuth in dgrok — use OPENAI_API_KEY. Prefer: dgrok provider setup.",
+        },
+        ModelPreset {
+            id: "groq",
+            model: "llama-3.3-70b-versatile",
+            base_url: "https://api.groq.com/openai/v1",
+            name: "Groq",
+            env_key: Some("GROQ_API_KEY"),
+            api_backend: Some("chat_completions"),
+            notes: "Groq OpenAI-compatible.",
+        },
+        ModelPreset {
+            id: "deepseek",
+            model: "deepseek-chat",
+            base_url: "https://api.deepseek.com/v1",
+            name: "DeepSeek",
+            env_key: Some("DEEPSEEK_API_KEY"),
+            api_backend: Some("chat_completions"),
+            notes: "DeepSeek OpenAI-compatible.",
+        },
     ]
+}
+
+/// Strip path suffixes users paste from docs (Grok appends the route itself).
+///
+/// `https://opencode.ai/zen/v1/chat/completions` → `https://opencode.ai/zen/v1`
+pub fn normalize_provider_base_url(raw: &str) -> String {
+    let mut s = raw.trim().trim_end_matches('/').to_string();
+    for suffix in ["/chat/completions", "/messages", "/responses"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.trim_end_matches('/').to_string();
+        }
+    }
+    s
+}
+
+/// OpenCode internal ids use `opencode/<id>`; the Zen HTTP API wants bare `<id>`.
+pub fn normalize_provider_model_id(model: &str) -> String {
+    let m = model.trim();
+    m.strip_prefix("opencode/")
+        .or_else(|| m.strip_prefix("opencode-go/"))
+        .unwrap_or(m)
+        .to_string()
 }
 
 pub fn user_config_toml_path() -> PathBuf {
@@ -183,6 +257,11 @@ pub fn upsert_model_table(
             "model id must be non-empty ASCII alphanumeric, '-' or '_' (config table key)".into(),
         );
     }
+    let model = normalize_provider_model_id(model);
+    let base_url = normalize_provider_base_url(base_url);
+    if base_url.is_empty() {
+        return Err("base_url must not be empty after normalization".into());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -211,8 +290,8 @@ pub fn upsert_model_table(
     }
 
     let mut entry = toml_edit::Table::new();
-    entry["model"] = toml_edit::value(model);
-    entry["base_url"] = toml_edit::value(base_url);
+    entry["model"] = toml_edit::value(&model);
+    entry["base_url"] = toml_edit::value(&base_url);
     if let Some(n) = name {
         entry["name"] = toml_edit::value(n);
     }
@@ -235,13 +314,25 @@ pub fn upsert_model_table(
     }
 
     std::fs::write(path, doc.to_string()).map_err(|e| e.to_string())?;
-    Ok(format!(
+    let mut msg = format!(
         "Wrote [model.{id}] to {}\n  model={model}\n  base_url={base_url}{}\nUse: dgrok -m {id}   or in TUI: /model {id}\nDocs: {CUSTOM_MODELS_DOC}",
         path.display(),
         env_key
-            .map(|e| format!("\n  env_key={e}  (export this env var; do not put secrets in TOML)"))
+            .map(|e| format!("\n  env_key={e}  (export this env var BEFORE starting dgrok; do not put secrets in TOML)"))
             .unwrap_or_default()
-    ))
+    );
+    if let Some(ek) = env_key {
+        let set = std::env::var(ek).map(|v| !v.trim().is_empty()).unwrap_or(false);
+        if !set {
+            msg.push_str(&format!(
+                "\n\nWARNING: {ek} is not set in this shell.\n\
+                 While logged into xAI, an unset env_key falls through to your session token,\n\
+                 and third-party APIs return 401 (looks like: Auth recovery succeeded but still 401).\n\
+                 Fix: export {ek}=… then restart dgrok."
+            ));
+        }
+    }
+    Ok(msg)
 }
 
 pub fn format_presets() -> String {
@@ -260,7 +351,9 @@ pub fn format_presets() -> String {
             notes = p.notes,
         ));
     }
-    out.push_str("Example:\n  dgrok provider add nvidia --model z-ai/glm-5.2 --set-default\n  export NVIDIA_API_KEY=…\n");
+    out.push_str(
+        "Examples:\n         dgrok provider add nvidia --model z-ai/glm-5.2 --set-default\n         export NVIDIA_API_KEY=…\n         dgrok provider add opencode --set-default\n         export OPENCODE_API_KEY=…   # from https://opencode.ai/zen\n         dgrok -m opencode\n         \n         Pitfalls that look like 401 auth recovery:\n         - base_url must NOT end with /chat/completions (Grok adds that path)\n         - OpenCode API model id is bare (mimo-v2.5-free), not opencode/mimo-v2.5-free\n         - env_key must be exported in the same shell before launching dgrok\n",
+    );
     out
 }
 
@@ -337,20 +430,47 @@ pub fn run_doctor() -> String {
                         {
                             let ek = table.get("env_key").and_then(|v| v.as_str());
                             let has_api_key = table.get("api_key").is_some();
+                            let model = table.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                            let base = table.get("base_url").and_then(|v| v.as_str()).unwrap_or("?");
                             let env_status = match ek {
                                 Some(name) => {
                                     if std::env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false)
                                     {
                                         format!("env_key={name} set=yes")
                                     } else {
-                                        format!("env_key={name} set=no  ← export {name}=…")
+                                        format!(
+                                            "env_key={name} set=no  ← export {name}=… or third-party 401"
+                                        )
                                     }
                                 }
                                 None if has_api_key => "api_key=present (prefer env_key)".into(),
-                                None => "no env_key/api_key".into(),
+                                None => "no env_key/api_key (session token will be sent)".into(),
                             };
-                            lines.push(format!("  {id}: {env_status}"));
+                            lines.push(format!("  {id}: model={model}"));
+                            lines.push(format!("       base_url={base}"));
+                            lines.push(format!("       {env_status}"));
+                            if base.contains("/chat/completions")
+                                || base.contains("/messages")
+                                || base.ends_with("/responses")
+                            {
+                                lines.push(
+                                    "       ⚠ base_url includes an API path suffix — use the /v1 root only"
+                                        .into(),
+                                );
+                            }
+                            if model.starts_with("opencode/") || model.starts_with("opencode-go/") {
+                                lines.push(
+                                    "       ⚠ model id has opencode/ prefix — Zen HTTP API wants bare id"
+                                        .into(),
+                                );
+                            }
                         }
+                    }
+                    if ids.is_empty() {
+                        lines.push(
+                            "No custom models — `dgrok provider add …` never wrote [model.*], or config was reset."
+                                .into(),
+                        );
                     }
                 }
                 Err(e) => lines.push(format!("TOML parse error: {e}")),
@@ -360,13 +480,18 @@ pub fn run_doctor() -> String {
     }
 
     lines.push(String::new());
+    lines.push("401 \"Auth recovery succeeded but … still rejected\" usually means:".into());
+    lines.push("  1) env_key not exported → Grok sends your xAI session token to a foreign host".into());
+    lines.push("  2) wrong API model id (e.g. opencode/mimo-v2.5-free → bare mimo-v2.5-free)".into());
+    lines.push("  3) base_url ends with /chat/completions (double path) or invalid API key".into());
+    lines.push(String::new());
     lines.push("Official multi-provider docs:".into());
     lines.push(format!("  {CUSTOM_MODELS_DOC}"));
-    lines.push("Quick setup:".into());
-    lines.push("  dgrok provider presets".into());
-    lines.push("  dgrok provider add nvidia --model z-ai/glm-5.2 --set-default".into());
-    lines.push("  export NVIDIA_API_KEY=…".into());
-    lines.push("  dgrok -m nvidia".into());
+    lines.push("Quick setup (OpenClaude-style wizard):".into());
+    lines.push("  dgrok provider setup".into());
+    lines.push("  # or in TUI: /provider setup".into());
+    lines.push("  dgrok provider endpoints   # list NVIDIA, OpenCode, Anthropic, Codex, …".into());
+    lines.push("  dgrok -m <config-id>       # after setup; /model shows provider on the right".into());
     lines.join("\n")
 }
 
@@ -375,15 +500,16 @@ pub fn run_provider_cli(args: ProviderArgs) -> Result<(), String> {
     match args.command.unwrap_or(ProviderCommand::Guide) {
         ProviderCommand::Guide => {
             println!(
-                "dgrok provider — manage official ~/.grok/config.toml [model.*] entries\n\n\
-                 Commands:\n\
-                   list                 List custom models in config.toml\n\
-                   presets              Show writeable presets\n\
-                   add <id|preset>      Write [model.<id>] (options: --model --base-url --env-key --api-backend --set-default --force)\n\
-                   guide                This message\n\n\
-                 This is UX around the built-in multi-provider feature (not a separate stack).\n\
+                "dgrok provider setup — pick an endpoint, paste a key, choose models. Start here.\n\
+                 (Same wizard as TUI /provider, no args.)\n\n\
+                 One-off fixes, not everyday use:\n\
+                   set-key              paste a key onto models that 401 (env var was unset)\n\
+                   list                 already-added models in config.toml\n\
+                   endpoints            the wizard's endpoint list, as text\n\
+                   add <id|preset>      non-interactive add, for scripting (--model --base-url --env-key --api-backend --set-default --force)\n\
+                   presets              raw preset table `add` reads from\n\n\
                  Docs: {CUSTOM_MODELS_DOC}\n\
-                 Also: dgrok doctor"
+                 Diagnose 401s: dgrok doctor"
             );
             Ok(())
         }
@@ -393,6 +519,37 @@ pub fn run_provider_cli(args: ProviderArgs) -> Result<(), String> {
         }
         ProviderCommand::Presets => {
             print!("{}", format_presets());
+            Ok(())
+        }
+        ProviderCommand::Endpoints => {
+            print!("{}", crate::provider_setup::format_endpoint_catalog());
+            Ok(())
+        }
+        ProviderCommand::Setup => {
+            let msg = crate::provider_setup::run_interactive_setup()?;
+            println!("{msg}");
+            Ok(())
+        }
+        ProviderCommand::SetKey {
+            env_key,
+            base_url_contains,
+            key,
+        } => {
+            let path = user_config_toml_path();
+            let msg = if let Some(k) = key {
+                crate::provider_setup::set_api_key_on_matching_models(
+                    &path,
+                    env_key.as_deref().or(Some("OPENCODE_API_KEY")),
+                    base_url_contains.as_deref(),
+                    &k,
+                )?
+            } else {
+                crate::provider_setup::run_interactive_set_key(
+                    env_key.as_deref(),
+                    base_url_contains.as_deref(),
+                )?
+            };
+            println!("{msg}");
             Ok(())
         }
         ProviderCommand::Add {
@@ -416,7 +573,7 @@ pub fn run_provider_cli(args: ProviderArgs) -> Result<(), String> {
                 )
             } else {
                 let m = model.ok_or_else(|| {
-                    "custom id requires --model (or use a preset: nvidia|openai|anthropic|ollama|openrouter)"
+                    "custom id requires --model (or use a preset: nvidia|opencode|openai|anthropic|ollama|openrouter)"
                         .to_string()
                 })?;
                 let b = base_url.ok_or_else(|| {
@@ -445,11 +602,21 @@ pub fn run_provider_cli(args: ProviderArgs) -> Result<(), String> {
 pub fn run_provider_slash(args: &str) -> String {
     let trimmed = args.trim();
     if trimmed.is_empty() || trimmed == "help" || trimmed == "guide" {
-        return "Official multi-provider config UX (writes ~/.grok/config.toml only).\n\
-                /provider list | presets | add <preset|id> … | guide\n\
-                CLI: dgrok provider …   dgrok doctor\n\
+        return "Add a provider: run /provider (no args) — that's the wizard, use it.\n\
+                \n\
+                Everything below is for one-off fixes, not everyday use:\n\
+                /provider list                already-added models\n\
+                /provider set-key            paste a key onto models that 401 (unset env var)\n\
+                /provider endpoints          the wizard's endpoint list, as text\n\
+                /provider add <id> …         non-interactive add (scripting)\n\
+                /provider presets            raw preset table `add` reads from\n\
                 Docs: 11-custom-models.md"
             .into();
+    }
+    // "setup" never reaches here — slash/commands/provider.rs::run intercepts
+    // empty/"setup" and returns Action::OpenProviderSetup (TUI wizard) first.
+    if trimmed == "endpoints" {
+        return crate::provider_setup::format_endpoint_catalog();
     }
     // Reuse clap by synthesizing argv
     let mut argv = vec!["provider".to_string()];
@@ -463,6 +630,16 @@ pub fn run_provider_slash(args: &str) -> String {
                 ProviderCommand::Guide => run_provider_slash(""),
                 ProviderCommand::List => format_list(&path),
                 ProviderCommand::Presets => format_presets(),
+                ProviderCommand::Endpoints => crate::provider_setup::format_endpoint_catalog(),
+                ProviderCommand::Setup => {
+                    "Use TUI wizard (Action) or: dgrok provider setup".into()
+                }
+                ProviderCommand::SetKey { .. } => {
+                    "Run in a terminal: dgrok provider set-key\n\
+                     Example: dgrok provider set-key --env-key OPENCODE_API_KEY\n\
+                     Example: dgrok provider set-key --base-url-contains nvidia.com"
+                        .into()
+                }
                 ProviderCommand::Add {
                     id,
                     base_url,
@@ -543,6 +720,41 @@ mod tests {
         assert!(body.contains("NVIDIA_API_KEY"));
         assert!(body.contains("default") && body.contains("nvidia"));
         assert!(body.contains("theme"));
+    }
+
+    #[test]
+    fn normalize_strips_chat_completions_and_opencode_prefix() {
+        assert_eq!(
+            normalize_provider_base_url("https://opencode.ai/zen/v1/chat/completions"),
+            "https://opencode.ai/zen/v1"
+        );
+        assert_eq!(
+            normalize_provider_model_id("opencode/mimo-v2.5-free"),
+            "mimo-v2.5-free"
+        );
+    }
+
+    #[test]
+    fn upsert_opencode_sanitizes_pasted_docs_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        upsert_model_table(
+            &path,
+            "opencode",
+            "opencode/mimo-v2.5-free",
+            "https://opencode.ai/zen/v1/chat/completions",
+            Some("OpenCode Zen"),
+            Some("OPENCODE_API_KEY"),
+            Some("chat_completions"),
+            true,
+            false,
+        )
+        .unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("mimo-v2.5-free"));
+        assert!(!body.contains("opencode/mimo"));
+        assert!(body.contains("https://opencode.ai/zen/v1"));
+        assert!(!body.contains("/chat/completions"));
     }
 
     #[test]
