@@ -184,9 +184,12 @@ function Install-FromSource {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         throw 'cargo not found — install from https://rustup.rs'
     }
+    $sourceRev = (git -C $repoRoot rev-parse --short HEAD 2>$null)
+    if (-not $sourceRev) { throw 'cannot resolve source revision' }
     Write-Host "Building dgrok (release) in $repoRoot …" -ForegroundColor DarkGray
     Push-Location $repoRoot
     try {
+        $env:DGROK_BUILD_COMMIT = $sourceRev
         & cargo build -p xai-grok-pager-bin --release
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
     } finally { Pop-Location }
@@ -195,6 +198,11 @@ function Install-FromSource {
         $src = Join-Path $repoRoot 'target\release\dgrok'
     }
     if (-not (Test-Path $src)) { throw "binary not found under target/release/dgrok*" }
+    $builtVersion = (& $src --version 2>$null) -join ''
+    if ($LASTEXITCODE -ne 0 -or -not $builtVersion.Contains("($sourceRev)")) {
+        throw "built binary does not match source revision ${sourceRev}: $builtVersion"
+    }
+    Write-Host "  verified binary revision: $sourceRev" -ForegroundColor DarkGray
     Install-Binary $src
 }
 

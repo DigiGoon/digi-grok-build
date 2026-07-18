@@ -212,6 +212,12 @@ finish() {
     fi
 
     ensure_path "$dest"
+    local active
+    active="$(command -v dgrok 2>/dev/null || true)"
+    if [ -n "$active" ] && ! cmp -s "$active" "$dest" 2>/dev/null; then
+        echo "  Warning: this shell still resolves dgrok to $active" >&2
+        echo "  Restart it, or run $dest directly." >&2
+    fi
     echo "" >&2
     if path_has_dir "$BIN_DIR"; then
         echo "Run 'dgrok' to get started!" >&2
@@ -364,6 +370,7 @@ sync_src_checkout() {
 build_from_source() {
     local profile="${DGROK_PROFILE:-release}"
     local repo_root="" cargo_flags=()
+    local source_rev=""
     local use_local_tree=0
     echo "No prebuilt release for this platform — building from source ($profile)…" >&2
 
@@ -399,6 +406,8 @@ build_from_source() {
         echo "Remove $SRC_DIR and re-run, or set DGROK_SRC / DGROK_REPO_SLUG." >&2
         exit 1
     fi
+    source_rev="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null)"
+    [ -n "$source_rev" ] || { echo "Error: cannot resolve source revision" >&2; exit 1; }
     if ! command -v cargo >/dev/null 2>&1; then
         echo "Installing rustup…" >&2
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -407,10 +416,16 @@ build_from_source() {
     fi
     [ "$profile" = "release" ] && cargo_flags+=(--release)
     echo "Building dgrok ($profile) in $repo_root …" >&2
-    (cd "$repo_root" && cargo build -p xai-grok-pager-bin "${cargo_flags[@]}")
+    (cd "$repo_root" && DGROK_BUILD_COMMIT="$source_rev" cargo build -p xai-grok-pager-bin "${cargo_flags[@]}")
     local bin="$repo_root/target/$profile/dgrok"
     [ -x "${bin}.exe" ] && bin="${bin}.exe"
     [ -x "$bin" ] || { echo "build produced no dgrok binary" >&2; exit 1; }
+    local built_version
+    built_version="$("$bin" --version 2>/dev/null)" || { echo "built dgrok failed to run" >&2; exit 1; }
+    case "$built_version" in
+        *"($source_rev)"*) echo "  verified binary revision: $source_rev" >&2 ;;
+        *) echo "Error: built binary does not match source revision $source_rev: $built_version" >&2; exit 1 ;;
+    esac
     install_bin "$bin"
     finish
 }

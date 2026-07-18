@@ -33,6 +33,8 @@ curl -fsSL https://raw.githubusercontent.com/DigiGoon/digi-grok-build/main/scrip
 dgrok --version
 ```
 
+Restart the terminal if the installer reports that another `dgrok` appears earlier in `PATH`.
+
 ```powershell
 irm https://raw.githubusercontent.com/DigiGoon/digi-grok-build/main/scripts/install.ps1 | iex
 dgrok --version
